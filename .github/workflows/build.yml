@@ -1,0 +1,60 @@
+name: Build vulnerability database
+
+# Builds the database from the (private) source repository and publishes it as assets of
+# the rolling "db" release of this public repository, so clients can download it
+# anonymously. Runs daily and on demand.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # create/update the "db" release of this repository
+
+concurrency:
+  group: vulnerability-db
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # Secrets: SOURCE_REPOSITORY names the private source repository ("owner/name"),
+      # kept secret so neither this public file nor the run logs reveal it; WAWAPAPI is a
+      # fine-grained token with read-only "Contents" access to that repository only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ secrets.SOURCE_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.WAWAPAPI }}
+          persist-credentials: false
+          path: source
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Build
+        working-directory: source
+        env:
+          # Optional: base64 Ed25519 seed from `go run ./cmd/wawapapi-db -keygen`.
+          # When unset the manifest is published unsigned.
+          WAWAPAPI_DB_SIGNING_KEY: ${{ secrets.WAWAPAPI_DB_SIGNING_KEY }}
+        run: go run ./cmd/wawapapi-db -out "$RUNNER_TEMP/db"
+
+      # The blob goes up before the manifest that names it, so a client never sees a
+      # manifest whose database is not there yet.
+      - name: Publish as assets of the rolling "db" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view db --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create db --repo "$GITHUB_REPOSITORY" --latest \
+              --title "Vulnerability database" \
+              --notes "Daily prebuilt database consumed by the wawapapi CLI and browser extension. Assets are overwritten by the scheduled workflow; latest.json gives the build time, checksum and sources."
+          gh release upload db --repo "$GITHUB_REPOSITORY" --clobber "$RUNNER_TEMP/db/wawapapi-db.json.gz"
+          gh release upload db --repo "$GITHUB_REPOSITORY" --clobber "$RUNNER_TEMP/db/latest.json"
+          jq '{built, sha256, bytes, counts}' "$RUNNER_TEMP/db/latest.json" >> "$GITHUB_STEP_SUMMARY"
